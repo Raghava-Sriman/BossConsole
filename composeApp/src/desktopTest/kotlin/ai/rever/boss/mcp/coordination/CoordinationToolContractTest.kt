@@ -257,15 +257,28 @@ class CoordinationToolContractTest {
     // ------------------------------------------------------------- input handling
 
     @Test
-    fun `files arrive as a json array and also as a comma separated string`() {
-        // McpToolArgs exposes only scalars, so the array is parsed out of raw. A model told
-        // "files" sometimes sends a string instead, and refusing that would fail a call over an
-        // encoding detail rather than anything the agent meant.
+    fun `files arrive as a json array, and a string is refused by the host schema`() {
+        // McpToolArgs exposes only scalars, so the array is parsed out of raw.
         val asArray = call("agent_claim", """{"agent_id":"a1","task":"t","files":["x.kt","y.kt"]}""")
         assertEquals(2, asArray.int("files_claimed"))
 
-        val asString = call("agent_claim", """{"agent_id":"a2","task":"t","files":"p.kt, q.kt"}""")
-        assertEquals(2, asString.int("files_claimed"))
+        // This provider used to accept a comma separated string as a kindness to a model that
+        // sent one. The host validates against inputSchema before the handler runs now, and the
+        // schema declares an array, so the leniency is unreachable and was removed rather than
+        // left as dead code behind a description promising it. The refusal names the argument
+        // and its expected type, which is what makes dropping it acceptable.
+        val stringArgs = """{"agent_id":"a2","task":"t","files":"p.kt, q.kt"}"""
+        val asString = runBlocking { core().invoke("agent_claim", stringArgs) }
+        assertTrue(asString.isError, "a string must be refused now, not silently split")
+        assertContains(asString.text, "files")
+    }
+
+    @Test
+    fun `a non string entry in files is dropped rather than stringified`() {
+        // JsonNull used to arrive as the literal path "null" and a number as its digits.
+        val claim = call("agent_claim", """{"agent_id":"mixed","task":"t","files":["real.kt",null,7,"also.kt"]}""")
+
+        assertEquals(2, claim.int("files_claimed"))
     }
 
     @Test
@@ -289,9 +302,18 @@ class CoordinationToolContractTest {
             assertContains(result.text, "agent_id")
         }
 
+        // The host's inputSchema validation refuses a missing required argument before the
+        // handler runs, so the message is the host's rather than this provider's. Strictly
+        // better - nothing is claimed and every tool words it the same way - so the assertion
+        // follows the host. `validateClaim`'s own empty-task branch still answers for a task
+        // that is PRESENT and blank, which the schema cannot express.
         val noTask = runBlocking { core.invoke("agent_claim", """{"agent_id":"ok"}""") }
         assertTrue(noTask.isError)
-        assertContains(noTask.text, "task is required")
+        assertContains(noTask.text, "task")
+
+        val blankTask = runBlocking { core.invoke("agent_claim", """{"agent_id":"ok","task":"   "}""") }
+        assertTrue(blankTask.isError, "a whitespace-only task must still be refused by the handler")
+        assertContains(blankTask.text, "task is required")
     }
 
     @Test

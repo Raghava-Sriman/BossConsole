@@ -274,24 +274,28 @@ internal object CoordinationMcpToolProvider : McpToolProvider {
      * The `files` argument.
      *
      * `McpToolArgs` exposes only top-level scalars, so an array has to be parsed out of [raw]
-     * by hand. A comma separated string is accepted too, because a model that has been told
-     * "files" will sometimes send one, and refusing it would fail a call over an encoding
-     * detail rather than anything the agent meant.
+     * by hand.
+     *
+     * This used to accept a comma separated string as well, on the reasoning that a model told
+     * "files" will sometimes send one and refusing over an encoding detail is unkind. **The host
+     * now validates arguments against `inputSchema` before the handler runs**, and the schema
+     * declares `files` an array, so that leniency became unreachable: a string is refused with
+     * "argument 'files' must be of type array" and this function is never called. Keeping it
+     * would have left dead code behind a tool description promising behaviour that cannot
+     * happen. Widening the schema to `["array", "string"]` was the alternative; the host's
+     * refusal is specific and actionable, and one declared shape for the argument is worth more
+     * than the leniency.
      */
     @Suppress("TooGenericExceptionCaught", "SwallowedException")
-    internal fun readFiles(args: McpToolArgs): List<String> {
-        val fromScalar = args.string("files")
-        val parsed =
-            try {
-                val root = Json.parseToJsonElement(args.raw) as? JsonObject
-                (root?.get("files") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content }
-            } catch (t: Throwable) {
-                null
-            }
-        return parsed
-            ?: fromScalar?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }
-            ?: emptyList()
-    }
+    internal fun readFiles(args: McpToolArgs): List<String> =
+        try {
+            val root = Json.parseToJsonElement(args.raw) as? JsonObject
+            (root?.get("files") as? JsonArray)
+                ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
+                .orEmpty()
+        } catch (t: Throwable) {
+            emptyList()
+        }
 
     private fun ok(payload: JsonObject) = McpToolResult(json.encodeToString(JsonObject.serializer(), payload))
 
