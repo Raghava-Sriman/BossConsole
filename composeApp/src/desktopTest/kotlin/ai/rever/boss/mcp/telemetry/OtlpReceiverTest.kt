@@ -27,7 +27,29 @@ class OtlpReceiverTest {
         receivers.clear()
     }
 
-    private fun receiver(): OtlpReceiver = OtlpReceiver(port = 0).also { receivers += it }
+    private fun receiver(requestTimeoutMs: Long = OtlpReceiver.REQUEST_TIMEOUT_MS): OtlpReceiver =
+        OtlpReceiver(port = 0, requestTimeoutMs = requestTimeoutMs).also { receivers += it }
+
+    /**
+     * A connection that sends headers declaring a body, then one byte of it, then nothing.
+     *
+     * Deliberately a raw [Socket] rather than `HttpURLConnection`: the point is to send a
+     * truthful `Content-Length` and then stop, which a well-behaved client API will not do.
+     */
+    private fun stalledRequest(port: Int): Socket =
+        Socket(InetAddress.getLoopbackAddress(), port).apply {
+            val request =
+                "POST ${OtlpReceiver.TRACES_PATH} HTTP/1.1\r\n" +
+                    "Host: 127.0.0.1\r\n" +
+                    "Content-Type: application/json\r\n" +
+                    "Content-Length: $STALLED_DECLARED_BYTES\r\n" +
+                    "\r\n" +
+                    "{"
+            getOutputStream().apply {
+                write(request.toByteArray())
+                flush()
+            }
+        }
 
     // ------------------------------------------------------------- buffer
 
@@ -188,6 +210,34 @@ class OtlpReceiverTest {
     }
 
     @Test
+    fun `a client that never finishes its body does not stop trace ingestion`() {
+        val receiver = receiver(requestTimeoutMs = STALL_TIMEOUT_MS)
+        val port = receiver.start().getOrThrow()
+
+        // One stalled client per handler thread, so every handler is occupied. Each declares a
+        // body in its Content-Length and then goes quiet forever, which is the slowloris shape:
+        // perfectly well-formed, and under no obligation to finish.
+        val stalled = List(OtlpReceiver.HANDLER_THREADS) { stalledRequest(port) }
+        try {
+            // Before the deadline existed this never returned: readNBytes blocked until EOF or
+            // the 8 MB cap on every handler, so a well-formed export behind them was never
+            // served. The status code is the whole assertion.
+            assertEquals(
+                200,
+                post(port, OtlpReceiver.TRACES_PATH, EXPORT_PAYLOAD),
+                "a stalled client must not hold a handler thread against a valid export",
+            )
+            assertEquals(1, receiver.buffer.stats().retained, "the valid export must have landed")
+            assertTrue(
+                receiver.timedOutCount() >= 1,
+                "the abandoned requests must be recorded as timed out, not silently dropped",
+            )
+        } finally {
+            stalled.forEach { socket -> runCatching { socket.close() } }
+        }
+    }
+
+    @Test
     fun `start is idempotent and stop releases the port`() {
         val receiver = receiver()
         val first = receiver.start().getOrThrow()
@@ -276,6 +326,12 @@ class OtlpReceiverTest {
 
     private companion object {
         const val CONNECT_TIMEOUT_MS = 5_000
+
+        /** Short, so the stalled-client test does not wait out the production deadline. */
+        const val STALL_TIMEOUT_MS = 800L
+
+        /** More body than the stalled client will ever send. */
+        const val STALLED_DECLARED_BYTES = 4096
 
         /** Shaped exactly like a real OTLP/HTTP JSON export. */
         val EXPORT_PAYLOAD =

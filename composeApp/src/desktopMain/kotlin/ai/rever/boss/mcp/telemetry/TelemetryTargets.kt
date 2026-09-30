@@ -35,6 +35,22 @@ internal enum class TargetRuntime(
 /** One inspectable process. */
 internal data class TelemetryTarget(
     val pid: Long,
+    /**
+     * The **executable path only**, never the command line.
+     *
+     * `ProcessHandle.Info.commandLine()` is argv, and argv routinely carries `--token=`,
+     * `-Dspring.datasource.password=`, presigned URLs and API keys. This tool enumerates the
+     * whole machine rather than only what the agent spawned, and it declares `readOnly = true`
+     * so the host's policy engine allows it with no operator prompt - which means an agent would
+     * relay up to [TelemetryTargets.MAX_TARGETS] processes' full arguments to a remote model on
+     * its own say-so, with no gate anywhere in the path.
+     *
+     * Redacting argv was the alternative and it is not safe enough: masking the value of a
+     * `--key=value` pair leaves a bare positional secret (`myapp s3cr3t`) untouched, so the
+     * redaction would have to be a guess about which words are secrets. The executable path
+     * cannot carry one. A caller that needs to tell two `java` processes apart uses the pid it
+     * spawned, which is how an agent reaches these tools in the first place.
+     */
     val command: String,
     val runtime: TargetRuntime,
     /** True when the profiling tools can actually reach it. Only JVMs can be. */
@@ -123,7 +139,10 @@ internal object TelemetryTargets {
                         val runtime = classify(command, arguments)
                         TelemetryTarget(
                             pid = handle.pid(),
-                            command = info.commandLine().orElse(command ?: "(unknown)"),
+                            // Executable path, deliberately NOT info.commandLine(). See the
+                            // TelemetryTarget.command KDoc: argv carries credentials and this
+                            // tool is ungated. `arguments` above stays local, for classify only.
+                            command = command ?: "(unknown)",
                             runtime = runtime,
                             // A JVM we cannot see in the attach list is still not attachable, so
                             // this is measured rather than inferred from the runtime.

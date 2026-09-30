@@ -2,10 +2,16 @@ package ai.rever.boss.mcp.telemetry
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-/** Runtime classification, sampler clamping, and histogram parsing. All pure. */
+/**
+ * Runtime classification, sampler clamping, histogram parsing, and what a target discloses.
+ *
+ * Pure apart from one test that lists this machine's own processes to pin the disclosure rule.
+ */
 class TelemetryUnitsTest {
     // ------------------------------------------------------------- classify
 
@@ -43,6 +49,37 @@ class TelemetryUnitsTest {
         assertEquals(TargetRuntime.NATIVE, TelemetryTargets.classify(null, emptyList()))
         // `-jar` alone is a JVM flag, so this one IS a jvm; the guard is that a random arg is not.
         assertEquals(TargetRuntime.NATIVE, TelemetryTargets.classify("/usr/bin/tar", listOf("-xzf", "a.tgz")))
+    }
+
+    @Test
+    fun `a listed target reports its executable path and never its command line`() {
+        val self = ProcessHandle.current()
+        val executable = self.info().command().orElse(null)
+        assertNotNull(executable, "this JVM reports no executable path, so the test proves nothing")
+
+        val target = TelemetryTargets.list(null).firstOrNull { it.pid == self.pid() }
+
+        assertNotNull(target, "the host process must be listed")
+        // The assertion that holds on every platform: what is reported IS the executable path.
+        assertEquals(executable, target.command)
+
+        // The stronger clause, where the platform can support it. Measured rather than assumed:
+        // on the Windows JVM this was written on, `commandLine()` is EMPTY, so the old code's
+        // `commandLine().orElse(command)` already fell back to the executable here and a test
+        // that required argv to be present failed for a reason that had nothing to do with the
+        // fix. It is populated on Linux and macOS, so a CI runner there does exercise this.
+        val commandLine = self.info().commandLine().orElse(null)
+        if (commandLine != null && commandLine != executable) {
+            assertNotEquals(
+                commandLine,
+                target.command,
+                "argv must never be reported: it carries tokens and passwords and this tool is ungated",
+            )
+            assertTrue(
+                target.command.length < commandLine.length,
+                "the reported command must be shorter than the full argv it was taken from",
+            )
+        }
     }
 
     @Test

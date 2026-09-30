@@ -28,9 +28,13 @@ import kotlinx.serialization.json.putJsonObject
  *
  * ## What it deliberately is not
  *
- * Not a second `PerformanceMonitor`. That object samples **this** process for the status bar
- * chart and has no MCP surface; this samples **other** processes on an agent's request and has no
- * UI. They overlap in subject and in nothing else.
+ * Not a second host self-metrics tool. `PerformanceMonitor` samples **this** process for the
+ * status bar chart, and `IntrospectionMcpToolProvider` exposes that same reading to an agent as
+ * `get_performance_metrics`. Both answer "how is BOSS itself doing".
+ *
+ * These answer a different question: how is the process the agent just **started** doing. They
+ * attach to another pid through `jdk.attach`, which nothing else in the host does, so they can
+ * profile, find a deadlock cycle and read a heap histogram in a JVM that is not this one.
  *
  * ## Governance
  *
@@ -85,9 +89,11 @@ internal object TelemetryMcpToolProvider : McpToolProvider {
         McpToolDefinition(
             name = "telemetry_list_targets",
             description =
-                "List local processes that can be inspected, newest and busiest first. Reports pid, command, " +
-                    "runtime (jvm/node/python/native), CPU seconds, resident memory, and whether the process is " +
-                    "attachable. Call this first: only targets with attachable=true can be profiled.",
+                "List local processes that can be inspected, newest and busiest first. Reports pid, the " +
+                    "executable path, runtime (jvm/node/python/native), CPU seconds, resident memory, and whether " +
+                    "the process is attachable. Call this first: only targets with attachable=true can be " +
+                    "profiled. Command line arguments are deliberately NOT reported, because they carry tokens " +
+                    "and passwords; identify a process by the pid you started it with.",
             inputSchema =
                 """
                 {

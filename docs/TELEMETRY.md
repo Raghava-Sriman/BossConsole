@@ -7,16 +7,23 @@ rereading the source and guessing. These MCP tools let it measure a running proc
 Clients see them as `mcp__boss__telemetry_*`. Implementation:
 `composeApp/src/desktopMain/kotlin/ai/rever/boss/mcp/telemetry/`.
 
-## How this differs from Performance Monitoring
+## How this differs from the host's own metrics
 
-They share a subject and nothing else.
+BOSS already reports on itself, and since `IntrospectionMcpToolProvider` it does so over MCP:
+`PerformanceMonitor` drives the status bar chart, and `get_performance_metrics` hands an agent
+that same reading. Those answer "how is BOSS itself doing". These tools answer "how is the
+process I just started doing", which nothing else here can.
 
-| | `PerformanceMonitor` | `telemetry_*` |
+| | `get_performance_metrics` | `telemetry_*` |
 |---|---|---|
-| Measures | this process | other processes, plus this one |
-| Surface | the status bar chart and `PerformanceDataProvider` | MCP tools |
-| Audience | the operator | the agent |
-| Trigger | a sampling loop | a tool call |
+| Subject | this BOSS process | any local process, including this one |
+| Mechanism | in process MXBeans | `jdk.attach` plus JMX into another pid |
+| Reports | heap, CPU, GC, window and tab counts | hot frames, deadlock cycles, heap histogram, spans |
+| Reach for it | before opening another tab or terminal | when something the agent started is slow or stuck |
+
+So the two are complementary rather than competing. If the question is about BOSS, call
+`get_performance_metrics`. If it is about the build, server or test run the agent just launched,
+call these.
 
 ## The tools
 
@@ -51,6 +58,25 @@ No tool declares `requiredPermissions`. This matches `WorkspaceMcpToolProvider`:
 loopback only for the local machine's own agents, and the documented posture there is that an
 undeclared tool is permitted. Operators who want these off should use the Toolbox kill switch,
 which is the control that always applies (an admin session short-circuits the RBAC check).
+
+### What a target does NOT disclose
+
+`telemetry_list_targets` reports each process's **executable path**, never its command line.
+Argument vectors routinely carry `--token=`, `-Dspring.datasource.password=`, presigned URLs and
+API keys; the tool enumerates the whole machine rather than only what the agent spawned; and it
+declares `readOnly = true`, so the policy engine allows it with no prompt. Those three together
+mean returning argv would relay up to 100 processes' arguments to a remote model with no operator
+in the path and no gate anywhere to add one.
+
+Redacting instead of omitting was considered and rejected: masking the value of a `--key=value`
+pair leaves a bare positional secret (`myapp s3cr3t`) untouched, so redaction would have to guess
+which words are secrets. An executable path cannot carry one. The cost is that two `java`
+processes look alike in the listing - identify the one you want by the pid you started it with,
+which is how an agent reaches these tools anyway. `TelemetryUnitsTest` pins this by asserting the
+reported command equals `ProcessHandle.Info.command()` and is shorter than the full argv.
+
+The host's own governance still applies to everything else here: sanitized arguments and error
+snippets reach the ledger under the caveat `AGENTS.md` records for them.
 
 ## How it works, and what that costs
 
@@ -156,6 +182,20 @@ Adding a framework back for one endpoint would reverse that decision. The receiv
   whole ceiling is kept rather than evicting the buffer to empty and looping.
 - **Request bodies are capped at 8 MB**, checked against `Content-Length` and again while
   reading, because a chunked request declares no length.
+- **And capped in TIME, because there are only two handler threads.** A client may declare a body
+  and then send nothing, which is well formed and under no obligation to finish; two of those
+  would otherwise hold both handlers for as long as they liked and trace ingestion would simply
+  stop. A body that has not arrived within ten seconds is abandoned with a 408 and counted.
+
+  This is two mechanisms on purpose. The read loop checks a deadline between chunks, which covers
+  a client dripping bytes slowly. It cannot cover a client that sends nothing at all, because the
+  first read blocks before any check runs and `com.sun.net.httpserver` exposes no socket to set
+  `SO_TIMEOUT` on - so `sun.net.httpserver.maxReqTime` is set as well (only when absent, since it
+  is a global JVM property), which makes the server itself close the exchange and free the thread.
+  That property is read during static initialisation, so it takes effect only if nothing in the
+  process created an `HttpServer` first, which is why it is the backstop rather than the fix.
+  `OtlpReceiverTest` stalls one client per handler thread and asserts a valid export still
+  returns 200.
 - **A busy port is not an error state.** If something already owns 4318 (a real collector, say),
   the tool says so and the other five tools keep working.
 - **Malformed input is skipped, never guessed at.** One bad span does not lose the rest of its

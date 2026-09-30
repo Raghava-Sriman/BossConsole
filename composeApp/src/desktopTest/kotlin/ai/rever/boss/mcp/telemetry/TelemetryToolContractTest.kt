@@ -132,7 +132,26 @@ class TelemetryToolContractTest {
         val result = runBlocking { core.invoke("telemetry_thread_state", "{}") }
 
         assertTrue(result.isError)
-        assertContains(result.text, "pid is required")
+        // The host validates arguments against `inputSchema` on the invoke path now, so a
+        // missing required argument is refused before the handler runs and the message is the
+        // host's rather than this provider's. That is strictly better - nothing attaches and
+        // every tool gets the same wording - so the assertion follows the host instead of
+        // pinning our own string. The handler's own `readPid` guard stays as the answer for a
+        // pid that is PRESENT and unusable (zero, negative, not a number), which the schema
+        // cannot express and which the next test covers.
+        assertContains(result.text, "pid")
+    }
+
+    @Test
+    fun `a present but unusable pid is refused by the handler`() {
+        val core = McpToolRegistryCore(disabledFile = null)
+        core.registerProvider(TelemetryMcpToolProvider)
+
+        listOf("""{"pid":0}""", """{"pid":-1}""").forEach { args ->
+            val result = runBlocking { core.invoke("telemetry_thread_state", args) }
+            assertTrue(result.isError, "$args should be refused")
+            assertContains(result.text, "positive integer", message = "for $args")
+        }
     }
 
     @Test
