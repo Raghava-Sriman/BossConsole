@@ -1,5 +1,7 @@
 package ai.rever.boss.mcp.session
 
+import ai.rever.boss.components.dialogs.McpUnsuccessfulCategory
+import ai.rever.boss.components.dialogs.unsuccessfulCategory
 import ai.rever.boss.mcp.McpApprovalDisposition
 import ai.rever.boss.mcp.McpOperationRecord
 import ai.rever.boss.mcp.McpPolicyAction
@@ -16,6 +18,90 @@ import kotlin.test.assertTrue
  */
 class SessionAnalyzerTest {
     private var clock = 1_000_000L
+
+    // ------------------------------------------------------- outcome classification
+
+    @Test
+    fun `a call cancelled in flight is indeterminate, because it may already have run`() {
+        // The host sets CANCELLED_IN_FLIGHT only after executionStarted, so the handler ran and
+        // a mutating tool may have finished its side effects. Calling that "blocked" told an
+        // agent whose write was cancelled mid-flight that the write never happened.
+        assertEquals(
+            CallOutcome.INDETERMINATE,
+            SessionAnalyzer.outcomeOf(McpApprovalDisposition.CANCELLED_IN_FLIGHT),
+        )
+        assertEquals(
+            CallOutcome.BLOCKED,
+            SessionAnalyzer.outcomeOf(McpApprovalDisposition.CANCELLED_AWAITING_APPROVAL),
+            "awaiting approval is the one cancel that is guaranteed pre-execution",
+        )
+
+        val report =
+            analyze(
+                listOf(
+                    call("project_replace", isError = true, disposition = McpApprovalDisposition.CANCELLED_IN_FLIGHT),
+                ),
+            )
+
+        assertEquals(0, report.blockedCalls, "an in-flight cancel must not be reported as blocked")
+        assertEquals(1, report.indeterminate.size)
+        assertEquals("project_replace", report.indeterminate.single().toolName)
+    }
+
+    @Test
+    fun `a call YOLO mode let through executed`() {
+        assertEquals(CallOutcome.EXECUTED, SessionAnalyzer.outcomeOf(McpApprovalDisposition.YOLO_ALLOWED))
+    }
+
+    @Test
+    fun `turning YOLO mode on is not a tool call`() {
+        // The host writes these markers into the same ledger with countsAsCall = false. Counting
+        // them would report a tool named yolo_mode with real call statistics.
+        val report =
+            analyze(
+                listOf(
+                    call("yolo_mode", disposition = McpApprovalDisposition.YOLO_ENABLED),
+                    call("telemetry_list_targets"),
+                    call("yolo_mode", disposition = McpApprovalDisposition.YOLO_DISABLED),
+                ),
+            )
+
+        assertEquals(1, report.totalCalls, "only the real call counts")
+        assertEquals(listOf("telemetry_list_targets"), report.tools.map { it.toolName })
+        assertTrue(report.indeterminate.isEmpty(), "markers are dropped, not reported as indeterminate")
+    }
+
+    @Test
+    fun `outcomeOf agrees with the host's own classification everywhere it must`() {
+        // The host classifies dispositions too, in McpActivityLogDialog.unsuccessfulCategory.
+        // Two enumerations of one enum is the drift this repo keeps recording, so where the two
+        // answer the same question they are pinned together here.
+        //
+        // CANCELLED is excluded on purpose and is the whole reason outcomeOf still exists: that
+        // bucket holds both a cancel that is guaranteed pre-execution and one that is guaranteed
+        // post-execution, so it cannot answer "did this run". FAILED is excluded for governance
+        // markers only, which are not calls at all.
+        McpApprovalDisposition.entries
+            .filterNot { it.isGovernanceEvent }
+            .forEach { disposition ->
+                val ours = SessionAnalyzer.outcomeOf(disposition)
+                when (disposition.unsuccessfulCategory) {
+                    McpUnsuccessfulCategory.DENIED, McpUnsuccessfulCategory.WITHHELD -> {
+                        assertEquals(CallOutcome.BLOCKED, ours, "$disposition is withheld by the host")
+                    }
+
+                    McpUnsuccessfulCategory.FAILED -> {
+                        assertEquals(CallOutcome.EXECUTED, ours, "$disposition reached the handler")
+                    }
+
+                    McpUnsuccessfulCategory.CANCELLED -> {
+                        // Asserted nowhere on purpose: this is the bucket the two classifications
+                        // genuinely disagree on, and the branch is here so a new category added
+                        // to the host's enum is a compile error rather than a silent skip.
+                    }
+                }
+            }
+    }
 
     private fun call(
         tool: String,

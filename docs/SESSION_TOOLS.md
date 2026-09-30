@@ -48,10 +48,19 @@ Both only read a log, so neither is mutating.
 - How many calls, how many failed, error rate.
 - Per tool: calls, errors, median and max duration. Median rather than mean, so one slow outlier
   does not make a tool look uniformly slow.
-- **Calls that never ran.** Dispositions such as `POLICY_DENIED`, `DENIED_BY_OPERATOR`, `TIMEOUT`
-  and `QUEUE_FULL` mean governance stopped the call. An agent often does not realise a tool was
-  blocked rather than executed, and then reasons from an outcome that never happened. The payload
-  says so in words.
+- **Calls that never ran**, under `blocked`. Dispositions such as `POLICY_DENIED`,
+  `DENIED_BY_OPERATOR`, `TIMEOUT`, `QUEUE_FULL`, `INVALID_ARGUMENTS` and the two `SECRET_*` ones
+  mean the tool was never reached. An agent often does not realise a call was stopped rather than
+  executed, and then reasons from an outcome that never happened. The payload says so in words.
+- **Calls that may or may not have run**, under `indeterminate`, with a different note. This is a
+  separate bucket because conflating it with the one above is a lie in the dangerous direction:
+  the host sets `CANCELLED_IN_FLIGHT` only after execution has started, so a mutating tool may
+  have completed its side effects before the coroutine was cancelled. An agent told "this did not
+  run" about a cancelled `project_replace` may apply the same change twice. The note tells it to
+  check actual state before retrying.
+- **Governance markers are not calls.** The host writes `YOLO_ENABLED` / `YOLO_DISABLED` into the
+  same ledger with `countsAsCall = false`, so they are dropped before anything is counted.
+  Otherwise the report would show a tool named `yolo_mode` with real call statistics.
 - **Loops**, in three shapes, each with different advice because the right next step differs:
 
 | Kind | Meaning | Advice |
@@ -100,6 +109,21 @@ Three properties matter more than the parsing.
 A ledger written by a newer build stays readable: unknown fields are ignored and an unknown
 disposition falls back to "executed" rather than "blocked", because over reporting "governance
 stopped you" would be a confusing lie.
+
+### Two classifications, on purpose
+
+The host classifies dispositions too, in `McpActivityLogDialog.unsuccessfulCategory`, and two
+enumerations of one enum is a drift this repo keeps recording. `SessionAnalyzer.outcomeOf` is
+still separate because it answers a question that property cannot: `unsuccessfulCategory` buckets
+`CANCELLED_AWAITING_APPROVAL` (guaranteed never to have run) together with `CANCELLED_IN_FLIGHT`
+(guaranteed to have started) as one CANCELLED category, and its FAILED bucket holds every
+*allowed* disposition, because for an entry that is already an error "allowed" means the tool
+itself failed.
+
+So `SessionAnalyzerTest` pins the two against each other on the buckets where they must agree -
+DENIED and WITHHELD are blocked, FAILED is executed - and excludes CANCELLED with that reason.
+Drift where agreement is required fails a test; the disagreement that is real is written down
+here rather than averaged away.
 
 ### The session window
 

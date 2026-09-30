@@ -5,8 +5,23 @@ import ai.rever.boss.mcp.McpOperationRecord
 
 /** Whether a recorded call actually ran, or was stopped before it could. */
 internal enum class CallOutcome {
+    /** The handler ran. Its side effects, if any, happened. */
     EXECUTED,
+
+    /** The handler never ran. Governance, a host fault or bad arguments stopped it first. */
     BLOCKED,
+
+    /**
+     * It cannot be known from the ledger whether the handler ran.
+     *
+     * Only `CANCELLED_IN_FLIGHT` and the legacy `CANCELLED` land here, and the distinction is
+     * load-bearing rather than pedantic: the host sets `CANCELLED_IN_FLIGHT` only after
+     * `executionStarted`, so a mutating tool may have completed its side effects before the
+     * coroutine was cancelled. Reporting that as BLOCKED told an agent whose `project_replace`
+     * was cancelled mid-write that the write never happened, which is false in the dangerous
+     * direction. A two-way answer cannot carry this, which is why there are three.
+     */
+    INDETERMINATE,
 }
 
 /** The shape of a repetition, ordered by how much an agent should care. */
@@ -65,6 +80,8 @@ internal data class SessionReport(
     val blockedCalls: Int,
     val tools: List<ToolStat>,
     val blocked: List<BlockedGroup>,
+    /** Calls whose handler may or may not have run. Reported separately from [blocked]. */
+    val indeterminate: List<BlockedGroup>,
     val loops: List<LoopFinding>,
 )
 
@@ -100,12 +117,33 @@ internal object SessionAnalyzer {
      * added later as the default, while an exhaustive `when` makes it a compile error here and
      * forces whoever adds it to decide.
      *
-     * Two entries are counter-intuitive and both come from the host's documented behaviour:
+     * Entries that are counter-intuitive, all from the host's documented behaviour:
      *
      * - `POLICY_PERSIST_FAILED` is **blocked**. A failed approval write withholds the call.
      * - `PROVIDER_TRUST_PERSIST_FAILED` is **executed**. The provider-wide path deliberately still
      *   runs the already-approved call when only the persistence failed, falling back to session
      *   trust for that one tool. `AGENTS.md` calls this asymmetry out explicitly.
+     * - `CANCELLED_IN_FLIGHT` is **indeterminate**, not blocked. See [CallOutcome.INDETERMINATE].
+     * - `YOLO_ENABLED` / `YOLO_DISABLED` are **not calls**. The host records them with
+     *   `countsAsCall = false`, and [analyze] drops them before anything here sees one; the
+     *   branch exists only to keep this `when` exhaustive, and answers INDETERMINATE so a
+     *   marker that ever did leak through could not be counted as a tool having run.
+     *
+     * ## Why this is not derived from `unsuccessfulCategory`
+     *
+     * The host already has a classification of dispositions in
+     * `McpActivityLogDialog.unsuccessfulCategory`, and a second enumeration of one enum is
+     * exactly the drift this repo keeps writing down. It was tried and it cannot answer this
+     * question: that property buckets `CANCELLED`, `CANCELLED_AWAITING_APPROVAL`,
+     * `CANCELLED_IN_FLIGHT` and `TIMEOUT` together as CANCELLED, and those differ on the one
+     * thing asked here - awaiting-approval and timeout never ran, in-flight may have. Its FAILED
+     * bucket also holds every allowed disposition, because for an *errored* entry "allowed"
+     * means the tool itself failed; that is a different question from "did it run".
+     *
+     * So the two stay separate, and `SessionAnalyzerTest` pins them against each other on the
+     * three buckets where they must agree (DENIED and WITHHELD are blocked, FAILED is executed),
+     * excluding CANCELLED with that reason. Drift where agreement is required is a test failure;
+     * the disagreement that is real is documented rather than averaged away.
      */
     fun outcomeOf(disposition: McpApprovalDisposition): CallOutcome =
         when (disposition) {
@@ -115,6 +153,7 @@ internal object SessionAnalyzer {
             McpApprovalDisposition.PERSISTENTLY_ALLOWED,
             McpApprovalDisposition.PROVIDER_TRUSTED,
             McpApprovalDisposition.PROVIDER_TRUST_PERSIST_FAILED,
+            McpApprovalDisposition.YOLO_ALLOWED,
             -> CallOutcome.EXECUTED
 
             McpApprovalDisposition.PERSISTENTLY_DENIED,
@@ -122,11 +161,18 @@ internal object SessionAnalyzer {
             McpApprovalDisposition.DENIED_BY_OPERATOR,
             McpApprovalDisposition.TIMEOUT,
             McpApprovalDisposition.POLICY_DENIED,
-            McpApprovalDisposition.CANCELLED,
             McpApprovalDisposition.CANCELLED_AWAITING_APPROVAL,
-            McpApprovalDisposition.CANCELLED_IN_FLIGHT,
             McpApprovalDisposition.QUEUE_FULL,
+            McpApprovalDisposition.INVALID_ARGUMENTS,
+            McpApprovalDisposition.SECRET_FORBIDDEN,
+            McpApprovalDisposition.SECRET_UNRESOLVED,
             -> CallOutcome.BLOCKED
+
+            McpApprovalDisposition.CANCELLED,
+            McpApprovalDisposition.CANCELLED_IN_FLIGHT,
+            McpApprovalDisposition.YOLO_ENABLED,
+            McpApprovalDisposition.YOLO_DISABLED,
+            -> CallOutcome.INDETERMINATE
         }
 
     fun analyze(
@@ -134,17 +180,25 @@ internal object SessionAnalyzer {
         windowStartMs: Long,
         windowEndMs: Long,
     ): SessionReport {
-        val blockedRecords = records.filter { outcomeOf(it.approvalDisposition) == CallOutcome.BLOCKED }
+        // Governance markers are not tool calls. The host writes YOLO_ENABLED / YOLO_DISABLED
+        // into the same ledger with `countsAsCall = false` and its own bottom bar skips them, so
+        // counting them here would report a tool named `yolo_mode` with real call counts and put
+        // a mode switch in an agent's per-tool statistics.
+        val calls = records.filterNot { it.approvalDisposition.isGovernanceEvent }
+        val byOutcome = calls.groupBy { outcomeOf(it.approvalDisposition) }
+        val blockedRecords = byOutcome[CallOutcome.BLOCKED].orEmpty()
+        val indeterminateRecords = byOutcome[CallOutcome.INDETERMINATE].orEmpty()
 
         return SessionReport(
             windowStartMs = windowStartMs,
             windowEndMs = windowEndMs,
-            totalCalls = records.size,
-            errorCalls = records.count { it.isError },
+            totalCalls = calls.size,
+            errorCalls = calls.count { it.isError },
             blockedCalls = blockedRecords.size,
-            tools = toolStats(records),
+            tools = toolStats(calls),
             blocked = blockedGroups(blockedRecords),
-            loops = detectLoops(records),
+            indeterminate = blockedGroups(indeterminateRecords),
+            loops = detectLoops(calls),
         )
     }
 

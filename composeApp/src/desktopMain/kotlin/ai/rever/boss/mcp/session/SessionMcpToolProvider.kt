@@ -199,8 +199,22 @@ internal object SessionMcpToolProvider : McpToolProvider {
     }
 
     private fun JsonObjectBuilder.putBlocked(report: SessionReport) {
-        putJsonArray("blocked") {
-            report.blocked.forEach { group ->
+        putGroups("blocked", report.blocked)
+        if (report.blocked.isNotEmpty()) put("blocked_note", BLOCKED_NOTE)
+
+        // Deliberately its own key with its own note. Folding these into `blocked` is what made
+        // session_review tell an agent a call did not run when it may have: see
+        // CallOutcome.INDETERMINATE.
+        putGroups("indeterminate", report.indeterminate)
+        if (report.indeterminate.isNotEmpty()) put("indeterminate_note", INDETERMINATE_NOTE)
+    }
+
+    private fun JsonObjectBuilder.putGroups(
+        key: String,
+        groups: List<BlockedGroup>,
+    ) {
+        putJsonArray(key) {
+            groups.forEach { group ->
                 add(
                     buildJsonObject {
                         put("tool_name", group.toolName)
@@ -210,7 +224,6 @@ internal object SessionMcpToolProvider : McpToolProvider {
                 )
             }
         }
-        if (report.blocked.isNotEmpty()) put("blocked_note", BLOCKED_NOTE)
     }
 
     private fun JsonObjectBuilder.putTools(report: SessionReport) {
@@ -318,6 +331,12 @@ internal object SessionMcpToolProvider : McpToolProvider {
             "restart; pass since_minutes to look further back."
 
     private const val BLOCKED_NOTE =
-        "These calls did NOT run. Governance stopped them, so any conclusion you drew from their result is " +
-            "unfounded. A denial needs an operator decision, not different arguments."
+        "These calls did NOT run. Governance, a host fault or invalid arguments stopped them before the tool " +
+            "was reached, so any conclusion you drew from their result is unfounded. A denial needs an operator " +
+            "decision, not different arguments."
+
+    private const val INDETERMINATE_NOTE =
+        "These calls were cancelled and it is NOT recorded whether the tool had already run. Treat their side " +
+            "effects as possible but unconfirmed: check the actual state before retrying, because a retry may " +
+            "be the second application of a change that already landed."
 }
